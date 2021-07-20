@@ -46,8 +46,13 @@ contract LiquidityOracle is OwnableUpgradeable {
 			cumulativeLiquidityDatas[todayTimestamp];
 		address swanAddress = addressBook.getAddress("BLACKSWAN");
 		address usdcAddress = addressBook.getAddress("USDC");
-		(uint256 tempLiquidityData, ) = getReserves(swanAddress, usdcAddress);
-		cumulativeData.cumulativeLiquidities += tempLiquidityData;
+		AggregatorV3Interface usdcUsdOracle =
+			AggregatorV3Interface(addressBook.getAddress("USDC_USD_ORACLE"));
+		int256 usdcUsdPrice = usdcUsdOracle.latestAnswer();
+		(, uint256 tempLiquidityData) = getReserves(swanAddress, usdcAddress);
+		cumulativeData.cumulativeLiquidities += ((2 *
+			tempLiquidityData *
+			uint256(usdcUsdPrice)) / 1e8);
 		cumulativeData.counter += 1;
 		LiquidityData memory newData =
 			LiquidityData(block.timestamp, tempLiquidityData);
@@ -57,7 +62,7 @@ contract LiquidityOracle is OwnableUpgradeable {
 	function getUsdcVolume() public view returns (uint256) {
 		address swanAddress = addressBook.getAddress("BLACKSWAN");
 		address usdcAddress = addressBook.getAddress("USDC");
-		(, uint256 usdcVolume ) = getReserves(swanAddress, usdcAddress);
+		(, uint256 usdcVolume) = getReserves(swanAddress, usdcAddress);
 		return usdcVolume;
 	}
 
@@ -95,5 +100,25 @@ contract LiquidityOracle is OwnableUpgradeable {
 		(reserveA, reserveB) = tokenA == token0
 			? (reserve0, reserve1)
 			: (reserve1, reserve0);
+	}
+
+	function swanPrice() public view returns (uint256) {
+		address swanAddress = addressBook.getAddress("BLACKSWAN");
+		address usdcAddress = addressBook.getAddress("USDC");
+		(uint256 swanReserve, uint256 usdcReserve) =
+			getReserves(swanAddress, usdcAddress);
+		return (usdcReserve * 1e18) / swanReserve;
+	}
+
+	function swanMarketCap(uint256 _totalSupply)
+		external
+		view
+		returns (uint256)
+	{
+		AggregatorV3Interface usdcUsdOracle =
+			AggregatorV3Interface(addressBook.getAddress("USDC_USD_ORACLE"));
+		int256 usdcUsdPrice = usdcUsdOracle.latestAnswer();
+		uint256 swanPriceInUsd = (swanPrice() * uint256(usdcUsdPrice)) / 1e8;
+		return (_totalSupply * swanPriceInUsd) / 1e18;
 	}
 }

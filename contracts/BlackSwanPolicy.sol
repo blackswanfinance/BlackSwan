@@ -7,12 +7,7 @@ import "./BlackSwanFund.sol";
 import "./libraries/SafeMath.sol";
 import "./libraries/SafeMathInt.sol";
 import "./AddressBook.sol";
-
-interface ILiquidityOracle {
-	function getData() external returns (uint256, bool);
-
-	function getUsdcVolume() external view returns (uint256);
-}
+import "./LiquidityOracle.sol";
 
 contract BlackSwanPolicy is OwnableUpgradeable {
 	using SafeMath for uint256;
@@ -22,13 +17,18 @@ contract BlackSwanPolicy is OwnableUpgradeable {
 		uint256 supplyDelta,
 		uint256 timestampSec
 	);
+	event LogLiquidityProvided(
+		uint256 indexed epoch,
+		uint256 timestamp,
+		uint256 liquidityLevel
+	);
 	//AddressBook to get addresses
 	AddressBook public addressBook;
 
 	//Store rebalance datas
 	struct RebalanceData {
 		uint256 timestamp;
-		uint256 liquidityPercentage;
+		uint256 liquidityVolume;
 	}
 	mapping(uint256 => RebalanceData) public rebalanceDatas;
 	// The number of rebalance cycles since inception
@@ -44,6 +44,10 @@ contract BlackSwanPolicy is OwnableUpgradeable {
 
 	// Block timestamp of last rebase operation
 	uint256 public lastRebalanceTimestampSec;
+	// Percentage amount of difference in order to provide rewards to swanlake
+	uint256 public provideAmountPercentage;
+
+	uint256 public averagePeriod;
 
 	// The rebalance window begins this many seconds into the minRebaseTimeInterval period.
 	// For example if minRebaseTimeInterval is 24hrs, it represents the time of day in seconds.
@@ -67,6 +71,8 @@ contract BlackSwanPolicy is OwnableUpgradeable {
 		epoch = 0;
 		bufferZone = 75;
 		minRebalanceTimeIntervalSec = 1 days;
+		averagePeriod = 14;
+		provideAmountPercentage = 10;
 		rebalanceWindowOffsetSec = 85440; // 11:44PM UTC
 		rebalanceWindowLengthSec = 16 minutes; // offset until midnight
 	}
@@ -88,27 +94,23 @@ contract BlackSwanPolicy is OwnableUpgradeable {
 		);
 		BlackSwanERC20 blackSwan =
 			BlackSwanERC20(addressBook.getAddress("BLACKSWAN"));
-		ILiquidityOracle liquidityOracle =
-			ILiquidityOracle(addressBook.getAddress("LIQUIDITY_ORACLE"));
+		LiquidityOracle liquidityOracle =
+			LiquidityOracle(addressBook.getAddress("LIQUIDITY_ORACLE"));
 		(uint256 liquidityVolume, bool volumeValid) = liquidityOracle.getData();
 		require(volumeValid);
 		epoch = epoch + 1;
-		uint256 currentSupply = blackSwan.totalSupply();
-		uint256 liquidityPercentage =
-			(liquidityVolume * 100 * 1e18) / (currentSupply);
 		int256 liquidityDifference =
-			int256(liquidityPercentage) - liquidityTargetEquilibrium;
+			int256(liquidityVolume) - liquidityTargetEquilibrium;
 		RebalanceData memory currentData =
-			RebalanceData(block.timestamp, liquidityPercentage);
+			RebalanceData(block.timestamp, liquidityVolume);
 		rebalanceDatas[epoch] = currentData;
 
 		if (liquidityDifference > 0) {
 			int256 liquidityIntDifference =
-				int256(liquidityDifference) / int256(10);
+				liquidityDifference / int256(provideAmountPercentage);
 			uint256 supplyDelta =
-				(currentSupply * uint256(liquidityIntDifference)) /
-					(100 * 1e18);
-
+				((uint256(liquidityIntDifference) * 1e6) /
+					liquidityOracle.swanPrice()) * 1e12;
 			uint256 newTotalSupply =
 				blackSwan.rebalance(epoch, supplyDelta, true);
 			uint256 stableCoinVolume = liquidityOracle.getUsdcVolume();
@@ -120,22 +122,16 @@ contract BlackSwanPolicy is OwnableUpgradeable {
 			assert(newTotalSupply <= MAX_SUPPLY);
 			emit LogRebalance(epoch, supplyDelta, block.timestamp);
 		} else if (liquidityDifference < 0) {
-			int256 liquidityIntDifference =
-				int256(liquidityDifference.abs()) / int256(10);
-			uint256 supplyDelta =
-				(currentSupply * uint256(liquidityIntDifference)) /
-					(100 * 1e18);
-
 			blackSwan.rebalance(epoch, 0, false);
 			if (
-				int256(liquidityPercentage) <
+				int256(liquidityVolume) <
 				(liquidityTargetEquilibrium * int256(bufferZone)) / 100
 			) {
 				BlackSwanFund(addressBook.getAddress("FUND_ADDRESS"))
 					.provideLiquidity();
 			}
 
-			emit LogRebalance(epoch, supplyDelta, block.timestamp);
+			emit LogLiquidityProvided(epoch, block.timestamp, liquidityVolume);
 		}
 		lastRebalanceTimestampSec = block.timestamp;
 		setLiquidityEquilibrium(liquidityDifference > 0 ? true : false);
@@ -155,9 +151,25 @@ contract BlackSwanPolicy is OwnableUpgradeable {
 	/**
 	 * @dev Set liquidity target for equilibrium calculations
 	 */
-	function setLiquidityTarget(int256 _newTarget) external onlyOwner {
-		require(_newTarget > 0);
-		liquidityTargetEquilibrium = _newTarget;
+	function setParams(
+		int256 _newTarget,
+		uint256 _bufferZone,
+		uint256 _provideAmountPercentage,
+		uint256 _averagePeriod
+	) external {
+		require(
+			addressBook.getAddress("SETTER") == _msgSender(),
+			"Only setter can call this method"
+		);
+		liquidityTargetEquilibrium = _newTarget == 0
+			? liquidityTargetEquilibrium
+			: _newTarget;
+		bufferZone = _bufferZone == 0 ? bufferZone : _bufferZone;
+		provideAmountPercentage = _provideAmountPercentage == 0
+			? provideAmountPercentage
+			: _provideAmountPercentage;
+
+		averagePeriod = _averagePeriod == 0 ? averagePeriod : _averagePeriod;
 	}
 
 	/**
@@ -166,13 +178,14 @@ contract BlackSwanPolicy is OwnableUpgradeable {
 	function setLiquidityEquilibrium(bool _belowEquilibrium) internal {
 		uint256 tempLiquidityLevel;
 
-		if (epoch >= 30) {
-			for (uint256 i = 0; i < 30; i++) {
-				tempLiquidityLevel += rebalanceDatas[epoch - i]
-					.liquidityPercentage;
+		if (epoch >= averagePeriod) {
+			for (uint256 i = 0; i < averagePeriod; i++) {
+				tempLiquidityLevel += rebalanceDatas[epoch - i].liquidityVolume;
 			}
 
-			liquidityTargetEquilibrium = int256(tempLiquidityLevel) / 30;
+			liquidityTargetEquilibrium = int256(
+				tempLiquidityLevel / averagePeriod
+			);
 		}
 	}
 }
